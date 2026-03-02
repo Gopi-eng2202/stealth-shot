@@ -33,23 +33,25 @@ func main() {
 
 	os.MkdirAll(*outputDir, 0755)
 	
-	// Initialize Files
-	csvFile, _ := os.Create(filepath.Join(*outputDir, "summary.csv"))
+	// Open files with Append/Create permissions
+	csvFile, _ := os.OpenFile(filepath.Join(*outputDir, "summary.csv"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	defer csvFile.Close()
-	mdFile, _ := os.Create(filepath.Join(*outputDir, "report.md"))
+	mdFile, _ := os.OpenFile(filepath.Join(*outputDir, "report.md"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	defer mdFile.Close()
 
-	// Writers
 	csvWriter := csv.NewWriter(csvFile)
-	csvWriter.Write([]string{"URL", "Status", "Title", "Screenshot"})
 	
-	fmt.Fprintln(mdFile, "# Stealth-Shot Recon Report")
-	fmt.Fprintln(mdFile, "| URL | Status | Title | Screenshot |")
-	fmt.Fprintln(mdFile, "| :--- | :--- | :--- | :--- |")
+	// Check if files are empty to write headers
+	fi, _ := csvFile.Stat()
+	if fi.Size() == 0 {
+		csvWriter.Write([]string{"URL", "Status", "Title", "Screenshot"})
+		fmt.Fprintln(mdFile, "# Stealth-Shot Recon Report")
+		fmt.Fprintln(mdFile, "| URL | Status | Title | Screenshot |")
+		fmt.Fprintln(mdFile, "| :--- | :--- | :--- | :--- |")
+	}
 
-	var mu sync.Mutex // Protects concurrent writes to files
+	var mu sync.Mutex 
 	limiter := rate.NewLimiter(rate.Every(time.Duration(*delay)*time.Second), 1)
-	
 	jobs := make(chan string)
 	var wg sync.WaitGroup
 
@@ -57,7 +59,7 @@ func main() {
 
 	for w := 1; w <= *threads; w++ {
 		wg.Add(1)
-		go worker(w, jobs, &wg, *outputDir, limiter, *proxy, csvWriter, mdFile, &mu)
+		go worker(w, jobs, &wg, *outputDir, limiter, *proxy, csvWriter, mdFile, &mu, csvFile)
 	}
 
 	file, _ := os.Open(*inputFile)
@@ -68,11 +70,10 @@ func main() {
 	close(jobs)
 	wg.Wait()
 	
-	csvWriter.Flush()
-	fmt.Println("\n[✔] Done! View 'report.md' on GitHub for the visual gallery.")
+	fmt.Println("\n[✔] Done! Files saved in:", *outputDir)
 }
 
-func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter *rate.Limiter, proxyAddr string, csvWriter *csv.Writer, mdFile *os.File, mu *sync.Mutex) {
+func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter *rate.Limiter, proxyAddr string, csvWriter *csv.Writer, mdFile *os.File, mu *sync.Mutex, csvFile *os.File) {
 	defer wg.Done()
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
@@ -95,13 +96,12 @@ func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter 
 		}
 
 		ctx, _ := chromedp.NewContext(allocCtx)
-		ctx, tCancel := context.WithTimeout(ctx, 45*time.Second)
+		ctx, tCancel := context.WithTimeout(ctx, 60*time.Second) // Increased timeout to 60s
 
 		var buf []byte
 		var title string
 		var statusCode int64
 
-		// Listen for Status Code
 		chromedp.ListenTarget(ctx, func(ev interface{}) {
 			if response, ok := ev.(*network.EventResponseReceived); ok {
 				if response.Response.URL == targetURL || response.Response.URL == targetURL+"/" {
@@ -116,7 +116,7 @@ func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter 
 			}),
 			chromedp.Navigate(targetURL),
 			chromedp.Title(&title),
-			chromedp.Sleep(10*time.Second),
+			chromedp.Sleep(12*time.Second), // Increased sleep for WAF challenges
 			chromedp.FullScreenshot(&buf, 90),
 		)
 
@@ -124,10 +124,12 @@ func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter 
 			filename := strings.ReplaceAll(domain, ".", "_") + ".png"
 			os.WriteFile(filepath.Join(dir, filename), buf, 0644)
 			
-			// Critical Section: Writing to reports
 			mu.Lock()
+			// Instant Write & Flush
 			csvWriter.Write([]string{targetURL, fmt.Sprintf("%d", statusCode), title, filename})
+			csvWriter.Flush()
 			fmt.Fprintf(mdFile, "| %s | %d | %s | ![Shot](%s) |\n", targetURL, statusCode, title, filename)
+			mdFile.Sync() // Force write to disk
 			mu.Unlock()
 			
 			fmt.Printf("[Worker %d] [+] %s [%d]\n", id, targetURL, statusCode)
