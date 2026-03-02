@@ -6,7 +6,6 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
