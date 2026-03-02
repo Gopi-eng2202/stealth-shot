@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"log"
@@ -12,72 +13,62 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdp/network"
 	"github.com/chromedp/chromedp"
 	"golang.org/x/time/rate"
 )
 
 func main() {
 	inputFile := flag.String("f", "", "File containing subdomains (required)")
-	outputDir := flag.String("o", "results", "Output directory for screenshots")
-	threads := flag.Int("t", 3, "Number of concurrent browser instances")
-	delay := flag.Int("d", 5, "Delay in seconds between requests per thread")
-	proxy := flag.String("proxy", "", "Optional: Proxy server (e.g., socks5://127.0.0.1:9050)")
+	outputDir := flag.String("o", "results", "Output directory")
+	threads := flag.Int("t", 3, "Number of concurrent threads")
+	delay := flag.Int("d", 5, "Delay in seconds between requests")
+	proxy := flag.String("proxy", "", "Optional: Proxy server URL")
 	flag.Parse()
 
 	if *inputFile == "" {
-		fmt.Println("\nUsage: go run main.go -f hosts.txt -o my_scan -t 3 -d 5")
+		fmt.Println("Usage: stealth-shot -f hosts.txt -o results")
 		os.Exit(1)
 	}
 
 	os.MkdirAll(*outputDir, 0755)
+	
+	// Initialize CSV Report
+	csvFile, _ := os.Create(filepath.Join(*outputDir, "summary.csv"))
+	defer csvFile.Close()
+	writer := csv.NewWriter(csvFile)
+	writer.Write([]string{"URL", "Status", "Title", "Screenshot"})
+	defer writer.Flush()
 
-	// 1. Setup Rate Limiter to stagger requests
 	limiter := rate.NewLimiter(rate.Every(time.Duration(*delay)*time.Second), 1)
-
-	// 2. Job Queue and Synchronization
 	jobs := make(chan string)
 	var wg sync.WaitGroup
+	var csvMu sync.Mutex // Mutex to prevent CSV write collisions
 
-	fmt.Printf("[!] Starting Stealth-Shot | Threads: %d | Delay: %ds | Proxy: %s\n\n", *threads, *delay, *proxy)
+	fmt.Printf("[!] Starting Stealth-Shot | Threads: %d | Delay: %ds\n\n", *threads, *delay)
 
-	// 3. Launch Workers
 	for w := 1; w <= *threads; w++ {
 		wg.Add(1)
-		go worker(w, jobs, &wg, *outputDir, limiter, *proxy)
+		go worker(w, jobs, &wg, *outputDir, limiter, *proxy, writer, &csvMu)
 	}
 
-	// 4. Feed Subdomains into the Queue
-	file, err := os.Open(*inputFile)
-	if err != nil {
-		log.Fatalf("[-] Error opening input file: %v", err)
-	}
-	defer file.Close()
-
+	file, _ := os.Open(*inputFile)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		domain := strings.TrimSpace(scanner.Text())
-		if domain != "" {
-			jobs <- domain
-		}
+		jobs <- scanner.Text()
 	}
-
 	close(jobs)
 	wg.Wait()
-	fmt.Println("\n[✔] Recon Complete. Screenshots saved in:", *outputDir)
 }
 
-func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter *rate.Limiter, proxyAddr string) {
+func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter *rate.Limiter, proxyAddr string, writer *csv.Writer, mu *sync.Mutex) {
 	defer wg.Done()
 
-	// Base Evasion Flags
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"), // Removes 'navigator.webdriver'
-		chromedp.Flag("incognito", true),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
 	)
-
-	// Add Proxy if provided
 	if proxyAddr != "" {
 		opts = append(opts, chromedp.ProxyServer(proxyAddr))
 	}
@@ -86,36 +77,50 @@ func worker(id int, jobs <-chan string, wg *sync.WaitGroup, dir string, limiter 
 	defer cancel()
 
 	for domain := range jobs {
-		limiter.Wait(context.Background()) // Respect the rate limit
-
+		limiter.Wait(context.Background())
 		targetURL := domain
 		if !strings.HasPrefix(targetURL, "http") {
 			targetURL = "https://" + targetURL
 		}
 
-		fmt.Printf("[Worker %d] Shooting: %s\n", id, targetURL)
-
-		// New context for every screenshot
 		ctx, _ := chromedp.NewContext(allocCtx)
-		ctx, timeoutCancel := context.WithTimeout(ctx, 40*time.Second)
+		ctx, tCancel := context.WithTimeout(ctx, 45*time.Second)
 
 		var buf []byte
+		var title string
+		var statusCode int64
+
+		// Listener for Network Events to catch the Status Code
+		chromedp.ListenTarget(ctx, func(ev interface{}) {
+			if response, ok := ev.(*network.EventResponseReceived); ok {
+				if response.Response.URL == targetURL || response.Response.URL == targetURL+"/" {
+					statusCode = response.Response.Status
+				}
+			}
+		})
+
 		err := chromedp.Run(ctx,
 			chromedp.ActionFunc(func(ctx context.Context) error {
-				// Final layer of JS stealth
 				return chromedp.Evaluate(`Object.defineProperty(navigator, 'webdriver', {get: () => undefined})`, nil).Do(ctx)
 			}),
 			chromedp.Navigate(targetURL),
-			chromedp.Sleep(10*time.Second), // Wait for Akamai challenges to solve
+			chromedp.Title(&title),
+			chromedp.Sleep(10*time.Second),
 			chromedp.FullScreenshot(&buf, 90),
 		)
 
-		if err != nil {
-			fmt.Printf("    [!] Failed %s: %v\n", domain, err)
-		} else {
+		if err == nil {
 			filename := strings.ReplaceAll(domain, ".", "_") + ".png"
 			os.WriteFile(filepath.Join(dir, filename), buf, 0644)
+			
+			mu.Lock()
+			writer.Write([]string{targetURL, fmt.Sprintf("%d", statusCode), title, filename})
+			mu.Unlock()
+			
+			fmt.Printf("[Worker %d] [+] %s [%d] - %s\n", id, targetURL, statusCode, title)
+		} else {
+			fmt.Printf("[Worker %d] [!] Failed %s\n", id, domain)
 		}
-		timeoutCancel()
+		tCancel()
 	}
 }
