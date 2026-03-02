@@ -40,10 +40,19 @@ stealth-shot -f hosts.txt -o proxy_scan -proxy socks5://127.0.0.1:9050
 | **`-proxy`** | Proxy server URL (e.g., `socks5://127.0.0.1:9050`). | `""` |
 
 ## 🕵️ Why Stealth-Shot?
-Most automated screenshotting tools are blocked by modern WAFs because they use default headless signatures. Stealth-Shot implements:
+Most automated screenshotting tools are blocked by modern WAFs because they use default headless signatures.
+Stealth-Shot implements:
 
-AutomationControlled Flag Removal: Native Chrome evasion.
+- AutomationControlled Flag Removal: Native Chrome evasion.
 
-navigator.webdriver Spoofing: Injects JS to hide automation properties.
+- navigator.webdriver Spoofing: Injects JS to hide automation properties.
 
-Worker Pool Pattern: Efficiently manages resources without "bursting" the WAF.
+- Worker Pool Pattern: Efficiently manages resources without "bursting" the WAF.
+
+## 🌟 Features
+
+- **Stealth Engine:** Bypasses `navigator.webdriver` detection.
+- **Worker Pool:** Thread-safe concurrent scanning.
+- **Rate Limiting:** Staggered requests to evade WAF burst detection.
+- **Metadata Extraction:** (NEW) Captures HTTP Status Codes and Page Titles.
+- **CSV Reporting:** (NEW) Generates a `summary.csv` for easy analysis.
